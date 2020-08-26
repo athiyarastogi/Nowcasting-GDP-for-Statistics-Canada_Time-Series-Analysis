@@ -1,0 +1,948 @@
+---
+title: "R Notebook"
+output:
+  pdf_document: default
+  html_notebook: default
+  html_document:
+    df_print: paged
+  word_document: default
+---
+
+##Introduction.
+
+Nowcasting is the method by which variables that are reported at a higher frequency may be used to predict variables that are predicted at a lower frequency. The goal of this paper is to develop a model that will use nowcasting to predict Quarterly Canadian GDP. 
+
+
+```{r include=FALSE}
+# Load required packages
+library(cansim)
+library(tidyverse)
+library(lubridate)
+library(forecast)
+library(gridExtra)
+library(fastDummies)
+library(xts)
+library(ggplot2)
+library(scales)
+library(ggthemes)
+library(gridExtra)
+library(astsa)
+library(broom)
+library(tseries)
+library(magrittr)
+library(qwraps2)
+
+set.seed(7)
+```
+Data is gathered from the Statistics Canada website. The variables considered are Canadian GDP, Investment, Government Spending, Interest Rate, Net Exports, Treasury Bills, Bank Rate, Earning, Employment, and Real Effective Exchange Rate (REER). These variables are known to be related to GDP and will most likely be useful in predicting GDP.
+
+Stationarity of the variables used in the model is checked to ensure future values can be predicted from the past data.
+```{r echo=FALSE, message=FALSE, warning=FALSE, include=FALSE}
+# Organize our quarterly data into useable objects.
+# This section will not be included in the final report. (Perhaps in the appendix).
+# This code gets all the quarterly varibles and puts it into both xts and data frame format
+# For the XTS format, each column Will be its own time series
+
+# USA GDP recorded Quarterly: 1947-01-01 to 2019-07-01
+US.Qrtr.GDP <- read.csv(file = "US_GDP_2012Chained_SeasonallyAdjusted.csv")
+
+# Set the starting time period that we will be interested in
+date.start = "2010 Q1"
+date.end = "2019 Q3"
+
+# Get Canism Vecotrs and merge External Data
+# This will be quarterly data: 2010-01-01 to 2019-07-01
+# What is ECR and EDR?
+data.df <- get_cansim_vector(
+  c(Total = "v62305753", C_HH = "v62305724", C_NP = "v62305730", C_Gov = "v62305731",
+    I_Bus = "v62305733", I_NP = "v62305739", I_Gov = "v62305740", Inventories = "v62305741", 
+    Exports = "v62305745", Imports = "v62305748", Labor_Productivity = "v29509276", 
+    ECR = "v114829787", EDR = "v114829804"), start_time = "1900-01-01") %>%
+  normalize_cansim_values() %>% 
+  dplyr::select(., c("Date", "label", "VALUE")) %>% 
+  rbind(US.Qrtr.GDP) %>% 
+  spread(key = "label", value = "VALUE") %>% 
+  mutate(C = C_HH + C_NP, I = I_Bus + I_NP + Inventories, G = C_Gov + I_Gov,
+         NX = Imports - Exports, EDR = lag(EDR), ECR = lag(ECR), 
+         Labor_Productivity = lag(Labor_Productivity), 
+         US_Quarterly_GDP = lag(US_Quarterly_GDP)) %>% 
+  dplyr::select(-c("C_HH", "C_NP", "C_Gov", "I_Bus", "I_NP", "I_Gov", 
+    "Imports", "Exports", "Inventories")) %>%
+  mutate(Y = year(Date), Q = quarter(Date), index = yearqtr(Y + Q/4))
+
+# Create the data as a XTS
+data.xts <- data.df %>% 
+  xts(x = .[,2:10], order.by = .$index) %>% 
+  window(start = as.yearqtr(date.start), end = as.yearqtr(date.end))
+
+# Create the data in as a data frame 
+data.df <- data.df[data.df$Y > 2009, ] 
+```
+
+```{r include=FALSE,echo=FALSE}
+# Organize the monthly data
+# This will not be included in the final report (Perhaps in the appendix)
+
+
+# Real Effective Exchange Rate: Weighted average of Canadian currency against other major currencies.
+# REER is recorded monthly: 1990-01-01 to 2019-06-01
+REER <- read.csv(file = "REER.csv")
+
+# Set the starting time period that we will be interested in
+date.start = "2010 Q1"
+date.end = "2019 Q3"
+
+# Gather all the data that is recorded monthly in one big table
+monthly.Var = get_cansim_vector(
+  c("Total Monthly GDP" = "v65201210",
+    "Total Empolyment (Including Unclassifed Businesses)"="v79310773",
+    "Average Weekly Earnings (Excluding Unclassified Businesses)" = "v79311153",
+    "Bank Rate" = "v122530",
+    "Real Return On Long Term Bond" = "v122553",
+    "Treasury bill auction - average yields: 3 month" = "v122541",
+    "Treasury bill auction - average yields: 6 month" = "v122552",
+    "Treasury bill auction - average yields: 1 year" = "v122498",
+    "Treasury bill auction - amount auctioned: 3 month" = "v122534",
+    "Treasury bill auction - amount auctioned: 6 month" = "v122535",
+    "Treasury bill auction - amount auctioned: 1 year" = "v122536",
+    "Treasury bill auction - amount maturing"= "v122537"), start_time = "1900-01-01") %>%
+  normalize_cansim_values() %>%
+  dplyr::select(c("Date","label","VALUE"))  %>% rbind(REER)
+
+format_vars <- function(raw_data, col_name){
+  # Format the monthly data
+  temp <- raw_data[raw_data$label == col_name,]
+  temp.date <- temp$Date
+  temp <- dplyr::select(temp, -c(label, Date))
+  temp <- as.xts(temp, order.by=temp.date, dateFormat="POSIXct", frequency=NULL, .RECLASS=FALSE)
+  index(temp) <- as.yearmon(index(temp))
+  return (temp)
+}
+
+Monthly.GDP <- format_vars(monthly.Var, "Total Monthly GDP")
+Monthly.REER <- format_vars(monthly.Var, "REER")
+Monthly.Earnings <- format_vars(monthly.Var, "Average Weekly Earnings (Excluding Unclassified Businesses)")
+Monthly.Employment <- format_vars(monthly.Var, "Total Empolyment (Including Unclassifed Businesses)")
+Monthly.BankRate <- format_vars(monthly.Var, "Bank Rate")
+Monthly.LongTermBond <- format_vars(monthly.Var, "Real Return On Long Term Bond")
+
+# Given a data frame and a column name it converts that column of Quarterly data to monthly format
+monthlySplit <- function(raw_data){
+  M = as.data.frame(raw_data) %>% 
+    # find year, quarter, month, and month-in-quarter
+    mutate(Y = year(time(raw_data)), Q = quarter(time(raw_data))-1, 
+           index = yearqtr(Y + Q/4), 
+           M = month(time(raw_data)),
+           MinQ = paste("M", (M-1)%%3, sep="")) %>%  
+    # spread monthly data into 3 columns one for each month-in-quarter
+    pivot_wider(id_cols = index, names_from = MinQ, 
+                values_from = VALUE)
+  return(M)
+}
+
+# Create XTS objects if desired
+monthlySplitXts <- function(raw_data){
+  M = monthlySplit(raw_data) %>% 
+    xts(x=.[,c("M0","M1","M2")], order.by =.$index) %>%
+    window(start=as.yearqtr(start(raw_data)),end =as.yearqtr(end(raw_data)))
+  return(M)
+}
+```
+
+```{r include=FALSE,echo=FALSE}
+check_stationarity <- function(data, MA_list, diff) {
+  
+  # Lets make our variables stationary.
+  max.months <- 9
+  
+  # the raw data
+ # par(mfrow=c(1,3))
+#  plot.ts(data, type='o', pch=16, main = "Plot of the Data")
+ # acf(data, na.action = na.pass, lag.max=max.months, xaxt="n", xlab="Lag (months)", main = "ACF of Data")
+  #axis(1, at=0:max.months/4, labels=0:max.months)
+  #pacf(data, na.action = na.pass, lag.max=max.months, xaxt="n", xlab="Lag (months)", main = "PACF of Data")
+  #axis(1, at=0:max.months/4, labels=0:max.months)
+  
+  # method 1
+  t1 <- time(data)
+  t2 <- factor(round((t1%%1)*4)+1)
+  out=lm(data~t1+t2)
+  data.lm <- ts(residuals(out), start = c(2010, 1), freq = 4) 
+  
+  #par(mfrow=c(1,3))
+  #plot.ts(data.lm, type='o', pch=16, main = "Removed Linear Trend")
+#  acf(data.lm, na.action = na.pass, lag.max=max.months, xaxt="n", xlab="Lag (months)", main = "ACF of Linear Trend")
+ # axis(1, at=0:max.months/4, labels=0:max.months)
+#  pacf(data.lm, na.action = na.pass, lag.max=max.months, xaxt="n", xlab="Lag (months)", main = "PACF of Linear Trend")
+ # axis(1, at=0:max.months/4, labels=0:max.months)
+  
+  # method 2
+  # compute the MA smoother
+  data.MA <- stats::filter(data, MA_list, sides=2)
+  # Save the results of the MA smoother as a xts
+  data.MA.Index <- yearqtr(index((data)))
+  data.MA <- xts(data.MA, order.by = data.MA.Index)
+  # Take the difference
+  final.MA <- data - data.MA
+
+ # par(mfrow=c(1,3))
+#  plot.ts( data, type='o', pch=16, col = "green", main = "Plot of the Data vs MA Smoother")
+ # par(new=TRUE)
+  #plot.ts( data.MA, type='o', pch=16, col = "blue")
+#  acf(final.MA, na.action = na.pass, lag.max=max.months, xaxt="n", xlab="Lag (months)", main = "ACF of MA Smoother")
+ # axis(1, at=0:max.months/4, labels=0:max.months)
+#  pacf(final.MA, na.action = na.pass, lag.max=max.months, xaxt="n", xlab="Lag (months)", main = "PACF of MA Smoother")
+ # axis(1, at=0:max.months/4, labels=0:max.months)
+  
+  # method 3
+  data.diff <- diff(data, differences = diff)
+  par(mfrow=c(1,3))
+#  plot.ts(data.diff, type='o', pch=16, main = "Plot of the Data with Differencing")
+ # acf(data.diff, na.action = na.pass, lag.max=max.months, xaxt="n", xlab="Lag (months)", main = "ACF of Differencing")
+#  axis(1, at=0:max.months/4, labels=0:max.months)
+ # pacf(data.diff, na.action = na.pass, lag.max=max.months, xaxt="n", xlab="Lag (months)", main = "PACF of Differencing")
+  #axis(1, at=0:max.months/4, labels=0:max.months)
+}
+```
+ 
+```{r include=FALSE,echo=FALSE}
+check_stationarity_monthly <- function(data, MA_list, diff) {
+   
+  max.months <- 20
+
+  # the raw data
+#  par(mfrow=c(1,3))
+ # plot.zoo(data, main = "Plot of the Data")  
+#  acf(data, na.action = na.pass, lag.max=max.months, xaxt="n", xlab="Lag (months)", main = "ACF of MA Smoother")
+ # axis(1, at=0:max.months/4, labels=0:max.months)
+  #pacf(data, na.action = na.pass, lag.max=max.months, xaxt="n", xlab="Lag (months)", main = "PACF of MA Smoother")
+  #axis(1, at=0:max.months/4, labels=0:max.months)
+
+  # method 1
+  t1 <- time(data)
+  t2 <- factor(round((t1%%1)*4)+1)
+  out=lm(data~t1+t2)
+  data.lm <- ts(residuals(out), start = start(data), freq = 12) 
+    
+#  par(mfrow=c(1,3))
+ # plot.zoo(data.lm, main = "Plot of the Data")
+  #acf(data.lm, na.action = na.pass, lag.max=max.months, xaxt="n", xlab="Lag (months)", main = "ACF of MA Smoother")
+#  axis(1, at=0:max.months/4, labels=0:max.months)
+ # pacf(data.lm, na.action = na.pass, lag.max=max.months, xaxt="n", xlab="Lag (months)", main = "PACF of MA Smoother")
+  #axis(1, at=0:max.months/4, labels=0:max.months)
+  
+  # method 2
+  # compute the MA smoother
+  data.MA <- stats::filter(data, MA_list, sides=2)
+  # Save the results of the MA smoother as a xts
+  data.MA <- xts(data.MA, order.by = index(data))
+
+  #data.MA.Index <- yearqtr(index((data.MA)))
+  # Take the difference
+  final.MA <- data - data.MA
+
+#  par(mfrow=c(1,3))
+ # plot.ts(x = index(data), y = data, type='o', pch=16, col = "green", main = "Plot of the Data vs MA Smoother")
+  #par(new=TRUE)
+#  plot.ts(x = index(data.MA), y = data.MA, type='o', pch=16, col = "blue", axes = FALSE, ann=FALSE)
+ # acf(final.MA, na.action = na.pass, lag.max=max.months, xaxt="n", xlab="Lag (months)", main = "ACF of MA Smoother")
+  #axis(1, at=0:max.months/4, labels=0:max.months)
+#  pacf(final.MA, na.action = na.pass, lag.max=max.months, xaxt="n", xlab="Lag (months)", main = "PACF of MA Smoother")
+ # axis(1, at=0:max.months/4, labels=0:max.months)
+  
+  # method 3
+  data.diff <- diff(data, differences = diff)
+  #par(mfrow=c(1,3))
+  #plot.ts(x = index(data.diff), y = data.diff, type='o', pch=16, main = "Plot of the Data with Differencing")
+#  acf(data.diff, na.action = na.pass, lag.max=max.months, xaxt="n", xlab="Lag (months)", main = "ACF of Differencing")
+ # axis(1, at=0:max.months/4, labels=0:max.months)
+  #pacf(data.diff, na.action = na.pass, lag.max=max.months, xaxt="n", xlab="Lag (months)", main = "PACF of Differencing")
+  #axis(1, at=0:max.months/4, labels=0:max.months)
+}
+```
+
+
+```{r include=FALSE}
+# Check stationarity.
+# check the proposed lambda
+lambda.total <- BoxCox.lambda(data.xts$Total)
+check_stationarity(data.xts$Total, c(0.5, 1, 1, 2, 3, 0.5), 6)
+check_stationarity(BoxCox(data.xts$Total, lambda.total), c(0.5, 1, 1, 2, 3, 0.5), 6)
+stationary.total <- diff(BoxCox(data.xts$Total, lambda.total), differences = 6)
+adf.test(na.omit(stationary.total, na.pass))
+```
+
+```{r include=FALSE,echo=FALSE}
+# Check stationarity.
+# check the proposed lambda
+lambda.total <- BoxCox.lambda(data.xts$US_Quarterly_GDP)
+check_stationarity(data.xts$US_Quarterly_GDP, c(0.5, 1, 1, 1, 1, 0.5), 3)
+check_stationarity(BoxCox(data.xts$US_Quarterly_GDP,lambda.total), c(0.5, 1, 1, 1, 1, 0.5), 3)
+stationary.US_Quarterly_GDP <- diff(BoxCox(data.xts$US_Quarterly_GDP,lambda.total), differences = 3)
+adf.test(na.omit(stationary.US_Quarterly_GDP, na.pass))
+```
+
+```{r include=FALSE,echo=FALSE}
+# Check stationarity.
+# check the proposed lambda
+lambda.total <- BoxCox.lambda(data.xts$C)
+check_stationarity(data.xts$C, c(0.5, 1, 0.5), 3)
+check_stationarity(BoxCox(data.xts$C,lambda.total), c(0.5, 1, 0.5), 3)
+stationary.C <- diff(data.xts$C, differences = 3)
+adf.test(na.omit(stationary.C, na.pass))
+```
+
+```{r include=FALSE,echo=FALSE}
+# Check stationarity.
+# check the proposed lambda
+lambda.total <- BoxCox.lambda(data.xts$I)
+check_stationarity(data.xts$I, c(0.5, 1, 0.5), 3)
+check_stationarity(BoxCox(data.xts$I,lambda.total), c(0.5, 1, 0.5), 3)
+stationary.I <- diff(data.xts$I, differences = 3)
+adf.test(na.omit(stationary.I, na.pass))
+
+```
+
+```{r, include=FALSE,echo=FALSE}
+# Check stationarity.
+# check the proposed lambda
+lambda.total <- BoxCox.lambda(data.xts$G)
+check_stationarity(data.xts$G, c(0.5, 1, 0.5), 12)
+check_stationarity(BoxCox(data.xts$G,lambda.total), c(0.5, 1, 0.5), 12)
+stationary.G <- diff(data.xts$G, differences = 12)
+adf.test(na.omit(stationary.G, na.pass))
+```
+
+```{r, include=FALSE,echo=FALSE}
+# Check stationarity.
+# check the proposed lambda
+lambda.total <- BoxCox.lambda(data.xts$NX)
+check_stationarity(data.xts$NX, c(0.5, 1, 0.5), 3)
+check_stationarity(BoxCox(data.xts$NX, lambda.total), c(0.5, 1, 0.5), 3)
+
+stationary.NX <- diff(data.xts$NX, differences = 3)
+adf.test(na.omit(stationary.NX, na.pass))
+```
+
+```{r, include=FALSE,echo=FALSE}
+lambda.total <- BoxCox.lambda(Monthly.GDP)
+
+check_stationarity_monthly(Monthly.GDP, c(0.5, 1, 1, 1, 1, 0.5), 6)
+check_stationarity_monthly(BoxCox(Monthly.GDP, lambda.total), c(0.5, 1, 1, 1, 1, 0.5), 6)
+
+stationary.GDP <- diff(Monthly.GDP, 6)
+adf.test(na.omit(stationary.GDP, na.pass))
+```
+
+```{r, include=FALSE,echo=FALSE}
+lambda.total <- BoxCox.lambda(Monthly.REER)
+
+check_stationarity_monthly(Monthly.REER, c(0.5, 1, 1, 1, 1, 0.5), 6)
+check_stationarity_monthly(BoxCox(Monthly.REER, lambda.total), c(0.5, 1, 1, 1, 1, 0.5), 6)
+
+stationary.REER <- diff(Monthly.REER, 6)
+adf.test(na.omit(stationary.REER, na.pass))
+```
+
+```{r, echo=FALSE,echo=FALSE}
+lambda.total <- BoxCox.lambda(Monthly.Earnings)
+
+check_stationarity_monthly(Monthly.Earnings, c(0.5, 1, 1, 1, 1, 0.5), 6)
+check_stationarity_monthly(BoxCox(Monthly.Earnings, lambda.total), c(0.5, 1, 1, 1, 1, 0.5), 6)
+
+stationary.Earnings <- diff(Monthly.Earnings, 6)
+adf.test(na.omit(stationary.Earnings, na.pass))
+```
+
+```{r, include=FALSE,echo=FALSE}
+lambda.total <- BoxCox.lambda(Monthly.Employment)
+
+check_stationarity_monthly(Monthly.Employment, c(0.5, 1, 1, 1, 1, 0.5), 3)
+check_stationarity_monthly(BoxCox(Monthly.Employment, lambda.total), c(0.5, 1, 1, 1, 1, 0.5), 6)
+
+stationary.Employment <- diff(Monthly.Employment, 3) 
+adf.test(na.omit(stationary.Employment, na.pass))
+```
+
+```{r, include=FALSE,echo=FALSE}
+# For now we ignore this.
+lambda.total <- BoxCox.lambda(Monthly.BankRate)
+
+check_stationarity_monthly(Monthly.BankRate, c(0.5, rep(1, 2), 0.5), 6)
+check_stationarity_monthly(BoxCox(Monthly.BankRate, lambda.total), c(0.5, 1, 1, 1, 1, 0.5), 6)
+
+stationary.BankRate <- diff(Monthly.BankRate, 6) 
+adf.test(na.omit(stationary.BankRate, na.pass))
+```
+
+```{r, include=FALSE,echo=FALSE}
+# For now we ignore this.
+lambda.total <- BoxCox.lambda(Monthly.LongTermBond)
+
+check_stationarity_monthly(Monthly.LongTermBond, c(0.5, rep(1, 6), 0.5), 6)
+check_stationarity_monthly(BoxCox(Monthly.LongTermBond, lambda.total), c(0.5, 1, 1, 1, 1, 0.5), 6)
+
+stationary.LongTermBond <- diff(Monthly.LongTermBond, 6) 
+adf.test(na.omit(stationary.LongTermBond, na.pass))
+```
+We consider plots of the variables as well as commonplace transformations in order to make them stationary. (Consult the appendix below for a description of the methodology followed here).
+```{r warning=FALSE, include=FALSE}
+library(vars) # for fitting VAR models
+# make sure its the same time periods
+stationary.NX.mapped <- stationary.NX*1000000
+
+stationary.GDP <- monthlySplitXts(stationary.GDP)
+stationary.Earnings <- monthlySplitXts(stationary.Earnings)
+stationary.REER <- monthlySplitXts(stationary.REER)
+stationary.Employment <- monthlySplitXts(stationary.Employment)
+stationary.LongTermBond <- monthlySplitXts(stationary.LongTermBond)
+```
+The first model we will consider is a regression based on the following variables: Total GDP, Investment, Consumption, Net Exports. Due to our previous work, all of these variables are stationary.
+```{r}
+# Model Option 1:
+X1 <- merge(stationary.total, stationary.I, stationary.G, stationary.C, stationary.NX.mapped)
+
+X1 <- na.omit(X1, na.action=na.pass)
+
+# select correct lag
+select <- VARselect(X1, lag.max = 3)$selection[1] #best AIC @ lag p=1
+# see the model
+out=VAR(X1,select)
+total.model.1 <- out$varresult[1]
+summary(total.model.1$Total)
+```
+For the second model, we added two more variables - Earnings and Employment. The second model is better than the first one as the Residual Standard Error of the first model (1895) is lower than Residual Standard Error of the the second model (21650). Also there more significant coefficients in the second model than the first model. 
+Third model involves all the variables. Second model is better than the Third model because of lesser number of significant variables and a higher Residual Standard Error than the Second Model.
+```{r}
+# Model Option 2:
+X2 <- merge(stationary.total, stationary.I, stationary.G, stationary.C, stationary.NX.mapped)
+
+X2 <- merge(X2, stationary.Earnings)
+colnames(X2)[(ncol(X2)-2):ncol(X2)] = c("Earnings.M0","Earnings.M1", "Earnings.M2")
+# 
+# X2 <- merge(X2, stationary.GDP)
+# colnames(X2)[(ncol(X2)-2):ncol(X2)] = c("GDP.M0","GDP.M1", "GDP.M2")
+# 
+X2 <- merge(X2, stationary.Employment)
+colnames(X2)[(ncol(X2)-2):ncol(X2)] = c("Employment.M0","Employment.M1", "Employment.M2")
+# 
+# X2 <- merge(X2, stationary.REER)
+# colnames(X2)[(ncol(X2)-2):ncol(X2)] = c("REER.M0","REER.M1", "REER.M2")
+# 
+# X2 <- merge(X2, stationary.LongTermBond)
+# colnames(X2)[(ncol(X2)-2):ncol(X2)] = c("LongTermBond.M0","LongTermBond.M1", "LongTermBond.M2")
+
+X2 <- na.omit(X2, na.action=na.pass)
+
+# select correct lag
+select <- VARselect(X2, lag.max = 2)$selection[1] #best AIC @ lag p=1
+# see the model
+out=VAR(X2,select)
+total.model.2 <- out$varresult[1]
+summary(total.model.2$Total)
+```
+
+```{r}
+# Model Option 3:
+X3 <- merge(stationary.total, stationary.I, stationary.G, stationary.C, stationary.NX.mapped)
+
+X3 <- merge(X3, stationary.Earnings)
+colnames(X3)[(ncol(X3)-2):ncol(X3)] = c("Earnings.M0","Earnings.M1", "Earnings.M2")
+
+X3 <- merge(X3, stationary.GDP)
+colnames(X3)[(ncol(X3)-2):ncol(X3)] = c("GDP.M0","GDP.M1", "GDP.M2")
+
+X3 <- merge(X3, stationary.Employment)
+colnames(X3)[(ncol(X3)-2):ncol(X3)] = c("Employment.M0","Employment.M1", "Employment.M2")
+
+X3 <- merge(X3, stationary.REER)
+colnames(X3)[(ncol(X3)-2):ncol(X3)] = c("REER.M0","REER.M1", "REER.M2")
+
+X3 <- merge(X3, stationary.LongTermBond)
+colnames(X3)[(ncol(X3)-2):ncol(X3)] = c("LongTermBond.M0","LongTermBond.M1", "LongTermBond.M2")
+
+X3 <- na.omit(X3, na.action=na.pass)
+
+# see the model
+out=VAR(X3,1)
+total.model.3 <- out$varresult[1]
+summary(total.model.3$Total)
+```
+
+Based on the generated graphs, second model is a better model as it closely resembles the original model.
+We used the kfold approach. In our case, we did not have a lot of data to begin with, so we used the 2-fold validatiaon approach for our models to see which one will get the best result. The main idea of this approach is to divide data into training and testing set, then to forecast the values using the models trained on the training set, and finally look and compare the results of the predicted values and the actual values.
+```{r}
+x1=X1[1:22]
+x2=X1[23:26]
+
+plot.xts(X1)
+
+# Checking model 1
+model.cv1=VARselect(x1)$selection[1] 
+out1=VAR(x1, model.cv1)
+total.model.cv1 <- out1$varresult[1]
+#summary(total.model.cv1$Total)
+test1=predict(out1, n.ahead = 4)
+#bind predicted data
+test1.data=cbind(Total=(test1$fcst$Total[,1]),I=(test1$fcst$I[,1]),G=(test1$fcst$G[,1]),C=(test1$fcst$C[,1]),NX=(test1$fcst$NX[,1]),Earnings.M0=(test1$fcst$Earnings.M0[,1]),Earnings.M1=(test1$fcst$Earnings.M1[,1]),Earnings.M2=(test1$fcst$Earnings.M2[,1]), Employment.M0=(test1$fcst$Employment.M0[,1]), Employment.M1=(test1$fcst$Employment.M1[,1]), Employment.M2=(test1$fcst$Employment.M2[,1]))
+cv.x2=xts(x=test1.data, order.by = time(x2))                
+cv.x2=rbind(cv.x2, x1)
+
+plot.xts(cv.x2)
+
+# Checking model 2
+x1=X2[1:22]
+x2=X2[23:26]
+
+model.cv1=VARselect(x1)$selection[1] 
+out1=VAR(x1, model.cv1)
+total.model.cv1 <- out1$varresult[1]
+#summary(total.model.cv1$Total)
+test1=predict(out1, n.ahead = 4)
+#bind predicted data
+test1.data=cbind(Total=(test1$fcst$Total[,1]),I=(test1$fcst$I[,1]),G=(test1$fcst$G[,1]),C=(test1$fcst$C[,1]),NX=(test1$fcst$NX[,1]),Earnings.M0=(test1$fcst$Earnings.M0[,1]),Earnings.M1=(test1$fcst$Earnings.M1[,1]),Earnings.M2=(test1$fcst$Earnings.M2[,1]), Employment.M0=(test1$fcst$Employment.M0[,1]), Employment.M1=(test1$fcst$Employment.M1[,1]), Employment.M2=(test1$fcst$Employment.M2[,1]))
+cv.x2=xts(x=test1.data, order.by = time(x2))                
+cv.x2=rbind(cv.x2, x1)
+
+plot.xts(cv.x2)
+
+# Checking model 2
+x1=X3[1:23]
+x2=X3[24:26]
+
+model.cv1=VARselect(x1,lag.max = 3)$selection[1] 
+out1=VAR(x1, model.cv1)
+total.model.cv1 <- out1$varresult[1]
+#summary(total.model.cv1$Total)
+test1=predict(out1, n.ahead = 3)
+#bind predicted data
+test1.data=cbind(Total=(test1$fcst$Total[,1]),I=(test1$fcst$I[,1]),G=(test1$fcst$G[,1]),C=(test1$fcst$C[,1]),NX=(test1$fcst$NX[,1]),Earnings.M0=(test1$fcst$Earnings.M0[,1]),Earnings.M1=(test1$fcst$Earnings.M1[,1]),Earnings.M2=(test1$fcst$Earnings.M2[,1]), Employment.M0=(test1$fcst$Employment.M0[,1]), Employment.M1=(test1$fcst$Employment.M1[,1]), Employment.M2=(test1$fcst$Employment.M2[,1]),GDP.M0=(test1$fcst$GDP.M0[,1]),GDP.M1=(test1$fcst$GDP.M1[,1]),GDP.M2=(test1$fcst$GDP.M2[,1]),REER.M0=(test1$fcst$REER.M0[,1]),REER.M1=(test1$fcst$REER.M1[,1]),REER.M2=(test1$fcst$REER.M2[,1]),LongTermBond.M0=(test1$fcst$LongTermBond.M0[,1]),LongTermBond.M1=(test1$fcst$LongTermBond.M1[,1]),LongTermBond.M2=(test1$fcst$LongTermBond.M2[,1]))
+cv.x2=xts(x=test1.data, order.by = time(x2))                
+cv.x2=rbind(cv.x2, x1)
+
+plot.xts(cv.x2)
+```
+
+#*Appendix*
+##Preprocessing data
+All the code that was used in the project is included in appendix for reference.
+This code gets all the quarterly varibles and puts it into both xts and data frame format
+For the XTS format, each column Will be its own time series
+```{r eval=FALSE}
+# Organize our quarterly data into useable objects.
+# This section will not be included in the final report. (Perhaps in the appendix).
+# This code gets all the quarterly varibles and puts it into both xts and data frame format
+# For the XTS format, each column Will be its own time series
+
+# USA GDP recorded Quarterly: 1947-01-01 to 2019-07-01
+US.Qrtr.GDP <- read.csv(file = "US_GDP_2012Chained_SeasonallyAdjusted.csv")
+
+# Set the starting time period that we will be interested in
+date.start = "2010 Q1"
+date.end = "2019 Q3"
+
+# Get Canism Vecotrs and merge External Data
+# This will be quarterly data: 2010-01-01 to 2019-07-01
+# What is ECR and EDR?
+data.df <- get_cansim_vector(
+  c(Total = "v62305753", C_HH = "v62305724", C_NP = "v62305730", C_Gov = "v62305731",
+    I_Bus = "v62305733", I_NP = "v62305739", I_Gov = "v62305740", Inventories = "v62305741", 
+    Exports = "v62305745", Imports = "v62305748", Labor_Productivity = "v29509276", 
+    ECR = "v114829787", EDR = "v114829804"), start_time = "1900-01-01") %>%
+  normalize_cansim_values() %>% 
+  dplyr::select(., c("Date", "label", "VALUE")) %>% 
+  rbind(US.Qrtr.GDP) %>% 
+  spread(key = "label", value = "VALUE") %>% 
+  mutate(C = C_HH + C_NP, I = I_Bus + I_NP + Inventories, G = C_Gov + I_Gov,
+         NX = Imports - Exports, EDR = lag(EDR), ECR = lag(ECR), 
+         Labor_Productivity = lag(Labor_Productivity), 
+         US_Quarterly_GDP = lag(US_Quarterly_GDP)) %>% 
+  dplyr::select(-c("C_HH", "C_NP", "C_Gov", "I_Bus", "I_NP", "I_Gov", 
+    "Imports", "Exports", "Inventories")) %>%
+  mutate(Y = year(Date), Q = quarter(Date), index = yearqtr(Y + Q/4))
+
+# Create the data as a XTS
+data.xts <- data.df %>% 
+  xts(x = .[,2:10], order.by = .$index) %>% 
+  window(start = as.yearqtr(date.start), end = as.yearqtr(date.end))
+
+# Create the data in as a data frame 
+data.df <- data.df[data.df$Y > 2009, ] 
+```
+
+##Organizing data
+Use the functions to split our monthly data into a 'Quarterly' format
+```{r}
+# Organize the monthly data
+# This will not be included in the final report (Perhaps in the appendix)
+
+
+# Real Effective Exchange Rate: Weighted average of Canadian currency against other major currencies.
+# REER is recorded monthly: 1990-01-01 to 2019-06-01
+REER <- read.csv(file = "REER.csv")
+
+# Set the starting time period that we will be interested in
+date.start = "2010 Q1"
+date.end = "2019 Q3"
+
+# Gather all the data that is recorded monthly in one big table
+monthly.Var = get_cansim_vector(
+  c("Total Monthly GDP" = "v65201210",
+    "Total Empolyment (Including Unclassifed Businesses)"="v79310773",
+    "Average Weekly Earnings (Excluding Unclassified Businesses)" = "v79311153",
+    "Bank Rate" = "v122530",
+    "Real Return On Long Term Bond" = "v122553",
+    "Treasury bill auction - average yields: 3 month" = "v122541",
+    "Treasury bill auction - average yields: 6 month" = "v122552",
+    "Treasury bill auction - average yields: 1 year" = "v122498",
+    "Treasury bill auction - amount auctioned: 3 month" = "v122534",
+    "Treasury bill auction - amount auctioned: 6 month" = "v122535",
+    "Treasury bill auction - amount auctioned: 1 year" = "v122536",
+    "Treasury bill auction - amount maturing"= "v122537"), start_time = "1900-01-01") %>%
+  normalize_cansim_values() %>%
+  dplyr::select(c("Date","label","VALUE"))  %>% rbind(REER)
+
+format_vars <- function(raw_data, col_name){
+  # Format the monthly data
+  temp <- raw_data[raw_data$label == col_name,]
+  temp.date <- temp$Date
+  temp <- dplyr::select(temp, -c(label, Date))
+  temp <- as.xts(temp, order.by=temp.date, dateFormat="POSIXct", frequency=NULL, .RECLASS=FALSE)
+  index(temp) <- as.yearmon(index(temp))
+  return (temp)
+}
+
+Monthly.GDP <- format_vars(monthly.Var, "Total Monthly GDP")
+Monthly.REER <- format_vars(monthly.Var, "REER")
+Monthly.Earnings <- format_vars(monthly.Var, "Average Weekly Earnings (Excluding Unclassified Businesses)")
+Monthly.Employment <- format_vars(monthly.Var, "Total Empolyment (Including Unclassifed Businesses)")
+Monthly.BankRate <- format_vars(monthly.Var, "Bank Rate")
+Monthly.LongTermBond <- format_vars(monthly.Var, "Real Return On Long Term Bond")
+
+# Given a data frame and a column name it converts that column of Quarterly data to monthly format
+monthlySplit <- function(raw_data){
+  M = as.data.frame(raw_data) %>% 
+    # find year, quarter, month, and month-in-quarter
+    mutate(Y = year(time(raw_data)), Q = quarter(time(raw_data))-1, 
+           index = yearqtr(Y + Q/4), 
+           M = month(time(raw_data)),
+           MinQ = paste("M", (M-1)%%3, sep="")) %>%  
+    # spread monthly data into 3 columns one for each month-in-quarter
+    pivot_wider(id_cols = index, names_from = MinQ, 
+                values_from = VALUE)
+  return(M)
+}
+
+# Create XTS objects if desired
+monthlySplitXts <- function(raw_data){
+  M = monthlySplit(raw_data) %>% 
+    xts(x=.[,c("M0","M1","M2")], order.by =.$index) %>%
+    window(start=as.yearqtr(start(raw_data)),end =as.yearqtr(end(raw_data)))
+  return(M)
+}
+
+```
+
+##Implementing stationarity on all variables
+In order to make the variables stationary 3 methods were implemented.
+```{r }
+check_stationarity <- function(data, MA_list, diff) {
+  
+  # Lets make our variables stationary.
+  max.months <- 9
+  
+  # the raw data
+  par(mfrow=c(1,3))
+  plot.ts(data, type='o', pch=16, main = "Plot of the Data")
+  acf(data, na.action = na.pass, lag.max=max.months, xaxt="n", xlab="Lag (months)", main = "ACF of Data")
+  axis(1, at=0:max.months/4, labels=0:max.months)
+  pacf(data, na.action = na.pass, lag.max=max.months, xaxt="n", xlab="Lag (months)", main = "PACF of Data")
+  axis(1, at=0:max.months/4, labels=0:max.months)
+  
+  # method 1
+  t1 <- time(data)
+  t2 <- factor(round((t1%%1)*4)+1)
+  out=lm(data~t1+t2)
+  data.lm <- ts(residuals(out), start = c(2010, 1), freq = 4) 
+  
+  par(mfrow=c(1,3))
+  plot.ts(data.lm, type='o', pch=16, main = "Removed Linear Trend")
+  acf(data.lm, na.action = na.pass, lag.max=max.months, xaxt="n", xlab="Lag (months)", main = "ACF of Linear Trend")
+  axis(1, at=0:max.months/4, labels=0:max.months)
+  pacf(data.lm, na.action = na.pass, lag.max=max.months, xaxt="n", xlab="Lag (months)", main = "PACF of Linear Trend")
+  axis(1, at=0:max.months/4, labels=0:max.months)
+  
+  # method 2
+  # compute the MA smoother
+  data.MA <- stats::filter(data, MA_list, sides=2)
+  # Save the results of the MA smoother as a xts
+  data.MA.Index <- yearqtr(index((data)))
+  data.MA <- xts(data.MA, order.by = data.MA.Index)
+  # Take the difference
+  final.MA <- data - data.MA
+
+  par(mfrow=c(1,3))
+  plot.ts( data, type='o', pch=16, col = "green", main = "Plot of the Data vs MA Smoother")
+  par(new=TRUE)
+  plot.ts( data.MA, type='o', pch=16, col = "blue")
+  acf(final.MA, na.action = na.pass, lag.max=max.months, xaxt="n", xlab="Lag (months)", main = "ACF of MA Smoother")
+  axis(1, at=0:max.months/4, labels=0:max.months)
+  pacf(final.MA, na.action = na.pass, lag.max=max.months, xaxt="n", xlab="Lag (months)", main = "PACF of MA Smoother")
+  axis(1, at=0:max.months/4, labels=0:max.months)
+  
+  # method 3
+  data.diff <- diff(data, differences = diff)
+  par(mfrow=c(1,3))
+  plot.ts(data.diff, type='o', pch=16, main = "Plot of the Data with Differencing")
+  acf(data.diff, na.action = na.pass, lag.max=max.months, xaxt="n", xlab="Lag (months)", main = "ACF of Differencing")
+  axis(1, at=0:max.months/4, labels=0:max.months)
+  pacf(data.diff, na.action = na.pass, lag.max=max.months, xaxt="n", xlab="Lag (months)", main = "PACF of Differencing")
+  axis(1, at=0:max.months/4, labels=0:max.months)
+}
+```
+
+```{r }
+check_stationarity_monthly <- function(data, MA_list, diff) {
+  
+  max.months <- 20
+
+  # the raw data
+  par(mfrow=c(1,3))
+  plot.zoo(data, main = "Plot of the Data")  
+  acf(data, na.action = na.pass, lag.max=max.months, xaxt="n", xlab="Lag (months)", main = "ACF of MA Smoother")
+  axis(1, at=0:max.months/4, labels=0:max.months)
+  pacf(data, na.action = na.pass, lag.max=max.months, xaxt="n", xlab="Lag (months)", main = "PACF of MA Smoother")
+  axis(1, at=0:max.months/4, labels=0:max.months)
+
+  # method 1
+  t1 <- time(data)
+  t2 <- factor(round((t1%%1)*4)+1)
+  out=lm(data~t1+t2)
+  data.lm <- ts(residuals(out), start = start(data), freq = 12) 
+    
+  par(mfrow=c(1,3))
+  plot.zoo(data.lm, main = "Plot of the Data")
+  acf(data.lm, na.action = na.pass, lag.max=max.months, xaxt="n", xlab="Lag (months)", main = "ACF of MA Smoother")
+  axis(1, at=0:max.months/4, labels=0:max.months)
+  pacf(data.lm, na.action = na.pass, lag.max=max.months, xaxt="n", xlab="Lag (months)", main = "PACF of MA Smoother")
+  axis(1, at=0:max.months/4, labels=0:max.months)
+  
+  # method 2
+  # compute the MA smoother
+  data.MA <- stats::filter(data, MA_list, sides=2)
+  # Save the results of the MA smoother as a xts
+  data.MA <- xts(data.MA, order.by = index(data))
+
+  #data.MA.Index <- yearqtr(index((data.MA)))
+  # Take the difference
+  final.MA <- data - data.MA
+
+  par(mfrow=c(1,3))
+  plot.ts(x = index(data), y = data, type='o', pch=16, col = "green", main = "Plot of the Data vs MA Smoother")
+  par(new=TRUE)
+  plot.ts(x = index(data.MA), y = data.MA, type='o', pch=16, col = "blue", axes = FALSE, ann=FALSE)
+  acf(final.MA, na.action = na.pass, lag.max=max.months, xaxt="n", xlab="Lag (months)", main = "ACF of MA Smoother")
+  axis(1, at=0:max.months/4, labels=0:max.months)
+  pacf(final.MA, na.action = na.pass, lag.max=max.months, xaxt="n", xlab="Lag (months)", main = "PACF of MA Smoother")
+  axis(1, at=0:max.months/4, labels=0:max.months)
+  
+  # method 3
+  data.diff <- diff(data, differences = diff)
+  par(mfrow=c(1,3))
+  plot.ts(x = index(data.diff), y = data.diff, type='o', pch=16, main = "Plot of the Data with Differencing")
+  acf(data.diff, na.action = na.pass, lag.max=max.months, xaxt="n", xlab="Lag (months)", main = "ACF of Differencing")
+  axis(1, at=0:max.months/4, labels=0:max.months)
+  pacf(data.diff, na.action = na.pass, lag.max=max.months, xaxt="n", xlab="Lag (months)", main = "PACF of Differencing")
+  axis(1, at=0:max.months/4, labels=0:max.months)
+}
+```
+
+##Stationarity analysis
+Function Check_stationarity() creates 8 plots in total. For each method that was described previously we create plots for time series, acf and pacf. You use these to determine how best to transform the data to make it stationary. We call check_stationarity twice, once with a BoxCox transformation and once without.
+The 9 plots check_stationarity() creates is as follows: 
+ - A plot of the TS you pass in along with an ACF and PACF of this series. 
+ - A MA smoother is applied to the TS and this is plotted along with the ACF and PACF. 
+ - Differencing is done to the TS and this is plotted with the ACF and PACF.
+check_stationarity() takes three arguments; the TA, the MA smoother you want to apply and the degree of differecing you want.
+
+###Stationarity check for Total GDP
+```{r echo=FALSE}
+# Check stationarity.
+# check the proposed lambda
+lambda.total <- BoxCox.lambda(data.xts$Total)
+check_stationarity(data.xts$Total, c(0.5, 1, 1, 2, 3, 0.5), 6)
+check_stationarity(BoxCox(data.xts$Total, lambda.total), c(0.5, 1, 1, 2, 3, 0.5), 6)
+stationary.total <- diff(BoxCox(data.xts$Total, lambda.total), differences = 6)
+adf.test(na.omit(stationary.total, na.pass))
+```
+###Stationarity check for US Quarterly GDP
+```{r echo=FALSE}
+# Check stationarity.
+# check the proposed lambda
+lambda.total <- BoxCox.lambda(data.xts$US_Quarterly_GDP)
+check_stationarity(data.xts$US_Quarterly_GDP, c(0.5, 1, 1, 1, 1, 0.5), 3)
+check_stationarity(BoxCox(data.xts$US_Quarterly_GDP,lambda.total), c(0.5, 1, 1, 1, 1, 0.5), 3)
+stationary.US_Quarterly_GDP <- diff(BoxCox(data.xts$US_Quarterly_GDP,lambda.total), differences = 3)
+adf.test(na.omit(stationary.US_Quarterly_GDP, na.pass))
+```
+
+###Stationarity check for consumption
+```{r echo=FALSE}
+# Check stationarity.
+# check the proposed lambda
+lambda.total <- BoxCox.lambda(data.xts$C)
+check_stationarity(data.xts$C, c(0.5, 1, 0.5), 3)
+check_stationarity(BoxCox(data.xts$C,lambda.total), c(0.5, 1, 0.5), 3)
+stationary.C <- diff(data.xts$C, differences = 3)
+adf.test(na.omit(stationary.C, na.pass))
+```
+###Stationarity check for investment
+```{r echo=FALSE}
+# Check stationarity.
+# check the proposed lambda
+lambda.total <- BoxCox.lambda(data.xts$I)
+check_stationarity(data.xts$I, c(0.5, 1, 0.5), 3)
+check_stationarity(BoxCox(data.xts$I,lambda.total), c(0.5, 1, 0.5), 3)
+stationary.I <- diff(data.xts$I, differences = 3)
+adf.test(na.omit(stationary.I, na.pass))
+
+```
+###Stationarity check for government spending
+```{r}
+# Check stationarity.
+# check the proposed lambda
+lambda.total <- BoxCox.lambda(data.xts$G)
+check_stationarity(data.xts$G, c(0.5, 1, 0.5), 12)
+check_stationarity(BoxCox(data.xts$G,lambda.total), c(0.5, 1, 0.5), 12)
+stationary.G <- diff(data.xts$G, differences = 12)
+adf.test(na.omit(stationary.G, na.pass))
+```
+###Stationarity check for Net Export
+```{r}
+# Check stationarity.
+# check the proposed lambda
+lambda.total <- BoxCox.lambda(data.xts$NX)
+check_stationarity(data.xts$NX, c(0.5, 1, 0.5), 3)
+check_stationarity(BoxCox(data.xts$NX, lambda.total), c(0.5, 1, 0.5), 3)
+
+stationary.NX <- diff(data.xts$NX, differences = 3)
+adf.test(na.omit(stationary.NX, na.pass))
+```
+###Stationarity check for Monthly GDP
+```{r}
+lambda.total <- BoxCox.lambda(Monthly.GDP)
+
+check_stationarity_monthly(Monthly.GDP, c(0.5, 1, 1, 1, 1, 0.5), 6)
+check_stationarity_monthly(BoxCox(Monthly.GDP, lambda.total), c(0.5, 1, 1, 1, 1, 0.5), 6)
+
+stationary.GDP <- diff(Monthly.GDP, 6)
+adf.test(na.omit(stationary.GDP, na.pass))
+```
+###Stationarity check for Monthly Real Effective Exchange Rate
+```{r}
+lambda.total <- BoxCox.lambda(Monthly.REER)
+
+check_stationarity_monthly(Monthly.REER, c(0.5, 1, 1, 1, 1, 0.5), 6)
+check_stationarity_monthly(BoxCox(Monthly.REER, lambda.total), c(0.5, 1, 1, 1, 1, 0.5), 6)
+
+stationary.REER <- diff(Monthly.REER, 6)
+adf.test(na.omit(stationary.REER, na.pass))
+```
+###Stationarity check for Monthly earnings
+```{r}
+lambda.total <- BoxCox.lambda(Monthly.Earnings)
+
+check_stationarity_monthly(Monthly.Earnings, c(0.5, 1, 1, 1, 1, 0.5), 6)
+check_stationarity_monthly(BoxCox(Monthly.Earnings, lambda.total), c(0.5, 1, 1, 1, 1, 0.5), 6)
+
+stationary.Earnings <- diff(Monthly.Earnings, 6)
+adf.test(na.omit(stationary.Earnings, na.pass))
+```
+###Stationarity check for Monthly Employment
+```{r}
+lambda.total <- BoxCox.lambda(Monthly.Employment)
+
+check_stationarity_monthly(Monthly.Employment, c(0.5, 1, 1, 1, 1, 0.5), 3)
+check_stationarity_monthly(BoxCox(Monthly.Employment, lambda.total), c(0.5, 1, 1, 1, 1, 0.5), 6)
+
+stationary.Employment <- diff(Monthly.Employment, 3) 
+adf.test(na.omit(stationary.Employment, na.pass))
+```
+###Stationarity check for Monthy Bank rate
+```{r}
+# For now we ignore this.
+lambda.total <- BoxCox.lambda(Monthly.BankRate)
+
+check_stationarity_monthly(Monthly.BankRate, c(0.5, rep(1, 2), 0.5), 6)
+check_stationarity_monthly(BoxCox(Monthly.BankRate, lambda.total), c(0.5, 1, 1, 1, 1, 0.5), 6)
+
+stationary.BankRate <- diff(Monthly.BankRate, 6) 
+adf.test(na.omit(stationary.BankRate, na.pass))
+```
+###Stationarity check for Monthly Long Term Bond
+```{r}
+# For now we ignore this.
+lambda.total <- BoxCox.lambda(Monthly.LongTermBond)
+
+check_stationarity_monthly(Monthly.LongTermBond, c(0.5, rep(1, 6), 0.5), 6)
+check_stationarity_monthly(BoxCox(Monthly.LongTermBond, lambda.total), c(0.5, 1, 1, 1, 1, 0.5), 6)
+
+stationary.LongTermBond <- diff(Monthly.LongTermBond, 6) 
+adf.test(na.omit(stationary.LongTermBond, na.pass))
+```
+
+
+```{r warning=FALSE}
+library(vars) # for fitting VAR models
+# make sure its the same time periods
+stationary.NX.mapped <- stationary.NX*1000000
+
+stationary.GDP <- monthlySplitXts(stationary.GDP)
+stationary.Earnings <- monthlySplitXts(stationary.Earnings)
+stationary.REER <- monthlySplitXts(stationary.REER)
+stationary.Employment <- monthlySplitXts(stationary.Employment)
+stationary.LongTermBond <- monthlySplitXts(stationary.LongTermBond)
+```
+
+```{r}
+# Model Option 1:
+X1 <- merge(stationary.total, stationary.I, stationary.G, stationary.C, stationary.NX.mapped)
+
+X1 <- na.omit(X1, na.action=na.pass)
+
+# select correct lag
+select <- VARselect(X1, lag.max = 3)$selection[1] #best AIC @ lag p=1
+# see the model
+out=VAR(X1,select)
+total.model.1 <- out$varresult[1]
+summary(total.model.1$Total)
+```
+
+```{r}
+# Model Option 2:
+X2 <- merge(stationary.total, stationary.I, stationary.G, stationary.C, stationary.NX.mapped)
+
+X2 <- merge(X2, stationary.Earnings)
+colnames(X2)[(ncol(X2)-2):ncol(X2)] = c("Earnings.M0","Earnings.M1", "Earnings.M2")
+# 
+# X2 <- merge(X2, stationary.GDP)
+# colnames(X2)[(ncol(X2)-2):ncol(X2)] = c("GDP.M0","GDP.M1", "GDP.M2")
+# 
+X2 <- merge(X2, stationary.Employment)
+colnames(X2)[(ncol(X2)-2):ncol(X2)] = c("Employment.M0","Employment.M1", "Employment.M2")
+# 
+# X2 <- merge(X2, stationary.REER)
+# colnames(X2)[(ncol(X2)-2):ncol(X2)] = c("REER.M0","REER.M1", "REER.M2")
+# 
+# X2 <- merge(X2, stationary.LongTermBond)
+# colnames(X2)[(ncol(X2)-2):ncol(X2)] = c("LongTermBond.M0","LongTermBond.M1", "LongTermBond.M2")
+
+X2 <- na.omit(X2, na.action=na.pass)
+
+# select correct lag
+select <- VARselect(X2, lag.max = 2)$selection[1] #best AIC @ lag p=1
+# see the model
+out=VAR(X2,select)
+total.model.2 <- out$varresult[1]
+summary(total.model.1$Total)
+```
